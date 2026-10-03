@@ -582,24 +582,27 @@ def prune(request: PruneRequest) -> dict[str, object]:
     The whole original graph is validated exactly as :func:`review` does, and
     every selected column must exist on the export node. The export node and
     all of its ancestor nodes are retained (shared nodes satisfy every branch
-    feeding them); nodes unreachable from the export are dropped. Columns are
-    then narrowed bottom-up by a reverse dependency-demand pass:
+    feeding them); nodes unreachable from the export are dropped. Demand for
+    the selected columns is seeded on the export and propagated bottom-up, and
+    every node's outputs are narrowed by it — the export projection/join is
+    trimmed just like any other:
 
-    * source columns are never trimmed;
+    * source columns are never trimmed (a source/filter export therefore keeps
+      every column and needs a trailing projection to narrow the selection);
     * a filter keeps its referenced columns and every column its consumers
       need;
-    * a projection and a join emit only the outputs that are needed — except
-      the export node, which is left fully intact;
+    * a projection and a join emit only the outputs that are needed;
     * a retained projection/join with no demanded output keeps its original
-      first output (and that output's dependencies);
-    * both join keys are always demanded on their side inputs.
+      first output (and that output's dependencies) — the export itself never
+      hits this case, since the selection is non-empty;
+    * both join keys are always demanded on their side inputs, and constant
+      outputs demand no upstream content while their input relation is kept.
 
-    When the export still contains columns the caller did not select, one
-    trailing projection (copying only the selected columns, in original order)
-    is appended so the final export exposes exactly the chosen columns. The
-    result must stay within the 60-node cap and re-review identically for the
-    selected columns; otherwise the request is rejected without any partial
-    graph.
+    A trailing projection (copying only the selected columns, in original
+    order) is appended solely when the export node still exposes columns the
+    caller did not select after the in-place narrowing. The result must stay
+    within the 60-node cap and re-review identically for the selected columns;
+    otherwise the request is rejected without any partial graph.
     """
     by_id, order, relations = _evaluate_graph(request)
     export_relation = relations[request.export]
@@ -626,8 +629,9 @@ def prune(request: PruneRequest) -> dict[str, object]:
     keep = _ancestors(request.export, by_id)
 
     # --- reverse pass: which output columns each retained node must emit ----
-    # The export node stays fully intact: seed every one of its outputs.
-    demanded: dict[str, set[str]] = {request.export: set(export_columns)}
+    # The export node is demanded exactly the selected columns, nothing more;
+    # it is trimmed in place like every other projection/join.
+    demanded: dict[str, set[str]] = {request.export: set(selected_in_order)}
     for nid in reversed(order):
         if nid not in keep:
             continue
@@ -643,28 +647,21 @@ def prune(request: PruneRequest) -> dict[str, object]:
             demanded[node.input].update(node.references)
 
         elif isinstance(node, ProjectionNodeIn):
-            if nid != request.export:
-                specs_by_name = {spec.name: spec for spec in node.columns}
-                if not needed:
-                    # No live output: preserve the node's first output instead
-                    # of emitting an (illegal) empty projection. Mutate the set
-                    # stored in ``demanded`` so the build phase sees the choice.
-                    needed.add(node.columns[0].name)
-                for name in needed:
-                    spec = specs_by_name[name]
-                    if not spec.is_constant:
-                        # A constant demands no upstream content, but its input
-                        # relation stays via the ancestor closure.
-                        demanded.setdefault(node.input, set()).add(spec.copy_name)
-            else:
-                # Export is untouched: every copy target must remain available.
-                demanded.setdefault(node.input, set())
-                for spec in node.columns:
-                    if not spec.is_constant:
-                        demanded[node.input].add(spec.copy_name)
+            specs_by_name = {spec.name: spec for spec in node.columns}
+            if not needed:
+                # No live output: preserve the node's first output instead
+                # of emitting an (illegal) empty projection. Mutate the set
+                # stored in ``demanded`` so the build phase sees the choice.
+                needed.add(node.columns[0].name)
+            for name in needed:
+                spec = specs_by_name[name]
+                if not spec.is_constant:
+                    # A constant demands no upstream content, but its input
+                    # relation stays via the ancestor closure.
+                    demanded.setdefault(node.input, set()).add(spec.copy_name)
 
         else:  # JoinNodeIn
-            if nid != request.export and not needed:
+            if not needed:
                 needed.add(node.outputs[0].alias)
             left_need = demanded.setdefault(node.left_input, set())
             right_need = demanded.setdefault(node.right_input, set())
@@ -688,7 +685,7 @@ def prune(request: PruneRequest) -> dict[str, object]:
             continue
         data = serialize_node(node)
 
-        if isinstance(node, ProjectionNodeIn) and nid != request.export:
+        if isinstance(node, ProjectionNodeIn):
             wanted = demanded[nid]
             kept_cols = [
                 col for col in data["columns"] if col["name"] in wanted
@@ -697,7 +694,7 @@ def prune(request: PruneRequest) -> dict[str, object]:
                 trimmed = True
             data["columns"] = kept_cols
 
-        elif isinstance(node, JoinNodeIn) and nid != request.export:
+        elif isinstance(node, JoinNodeIn):
             wanted = demanded[nid]
             kept_outs = [
                 out for out in data["outputs"] if out["alias"] in wanted
@@ -710,8 +707,16 @@ def prune(request: PruneRequest) -> dict[str, object]:
 
     dropped_nodes = [node.id for node in request.nodes if node.id not in keep]
 
-    # --- trailing projection when the export still has unselected columns ---
-    needs_trailing = set(export_columns) != selected_set
+    # --- trailing projection only if the export still exposes other columns -
+    # A trimmed projection/join export already exposes exactly the selection;
+    # source/filter exports cannot shed columns and therefore always need one
+    # when fewer than all columns were selected.
+    export_node = by_id[request.export]
+    if isinstance(export_node, (ProjectionNodeIn, JoinNodeIn)):
+        export_kept = demanded[request.export]
+    else:
+        export_kept = set(export_columns)
+    needs_trailing = export_kept != selected_set
     if needs_trailing and len(new_node_dicts) + 1 > NODE_LIMIT:
         raise ValidationError(
             "PRUNE_NODE_LIMIT",
