@@ -12,8 +12,8 @@
 导出图（只允许在导出末尾追加一个投影节点），详见下文“安全修订”。
 
 此外提供 `POST /api/prune`：按选定的导出列把图**精简**为只保留这些列及其全部依赖祖先的
-等价图——删除无关分支与无用投影/连接输出，最终导出只含选定列（沿用原列序），所选列的内容与
-行影响原因与原图完全一致，详见下文“按导出列精简”。
+等价图——删除无关分支、从选定列反向传播并裁剪导出投影/连接本身的未选输出及无用复制依赖，
+最终导出只含选定列（沿用原列序），所选列的内容与行影响原因与原图完全一致，详见下文“按导出列精简”。
 
 ## 风险传播规则
 
@@ -303,15 +303,20 @@ curl -s -i -X POST http://localhost:8080/api/revise \
 1. **节点保留**：保留导出节点及其**全部依赖祖先**，删除从导出不可达的其余节点。
    共享节点满足所有引用它的分支需求（一个节点同时喂给筛选与连接时取需求并集，不复制节点）。
    常量列不要求上游**列**，但其输入**关系**（节点）不能删除。
-2. **反向需求传播**（自导出向上游）：
+2. **反向需求传播**（自**选定列**开始、自导出向上游；导出投影/连接与其他投影/连接一样参与裁剪）：
    * **source 不裁剪**，源列与 `sensitive` 标记原样保留；
    * **filter** 保留条件 `references` 引用列，以及其下游仍需读取的列；条件不被修改；
-   * **projection / join 只保留被需要的输出**；两侧**连接键始终保留**（它们决定行集合）；
+   * **projection / join（含导出节点）只保留被需要的输出**：未选定的导出输出、以及只被这些
+     输出复制的上游列都不再保留；两侧**连接键始终保留**（它们决定行集合）；
    * 某投影/连接虽被保留但已无任何被需要的输出时，保留其**原第一个输出**及其依赖，
      绝不产生空输出的非法节点；
-   * **导出节点本身不裁剪**（其输出、常量、连接键与条件保持原样）。
-3. **尾部投影**：当导出节点仍含未选定列时，在其后追加一个 ID 不与已有节点冲突的
-   `projection`（输入即原导出节点），只按**原列序** `copy` 选定列；导出已只含选定列时不追加。
+   * 常量输出不产生上游列需求（但其输入关系仍在）。
+3. **尾部投影（仅在确实需要时）**：是否追加**只取决于裁剪后导出节点实际暴露的列集**——
+   * 导出为 projection / join 时，其输出已被就地裁剪为恰好选定列，**不追加**（因此满 60 节点、
+     可就地缩列的图仍能成功）；
+   * 导出为 source 时源列不裁剪；导出为 filter 时会透传输入关系中存活的列（条件引用的未选列
+     仍在）：这两种情况下导出可能仍含未选列，才在其后追加一个 ID 不与已有节点冲突的
+     `projection`（输入即原导出节点），只按**原列序** `copy` 选定列。
 4. **保持不变量**：保留原节点 ID；保留节点在原请求中的相对顺序，以及节点内列/别名的相对顺序；
    不修改 `sensitive` 标记、常量值与筛选条件。
 5. **语义等价但不“变安全”**：最终导出只含选定列；每个选定列的 `content_reasons` /
@@ -320,7 +325,8 @@ curl -s -i -X POST http://localhost:8080/api/revise \
 ### 拒绝（HTTP 400，不返回部分图）
 
 * 选定列名在导出节点上不存在（即使图本身安全也检查）：`PRUNE_COLUMN_NOT_FOUND`；
-* 需要追加尾部投影且追加后节点数**超过 60**：`PRUNE_NODE_LIMIT`；
+* 裁剪后导出仍含未选列、确需追加尾部投影，且追加后节点数**超过 60**：`PRUNE_NODE_LIMIT`
+  （可就地缩列的 60 节点图不会触发；只有确实需要第 61 个节点时才拒绝）；
 * 构造出的精简图对选定列的复审与原图不一致：`PRUNE_REVIEW_MISMATCH`（内部不变量，正常不会出现）；
 * 以及 `/api/review` 的全部原图校验（`DUPLICATE_NODE` / `COLUMN_CONFLICT` /
   `INVALID_REFERENCE` / `CYCLE`）——整次请求先校验整张原图，无关分支的错误同样拒绝。
@@ -340,8 +346,9 @@ curl -s -X POST http://localhost:8080/api/prune \
   --data @examples/prune_request.json
 ```
 
-返回（节选）：导出节点 `export_users` 原样保留，末尾追加只复制两列的投影
-`export_users__export`；最终只含选定列、沿用原列序：
+返回（节选）：导出节点 `export_users` 被**就地裁剪**——未选定的 `mail` 及其复制依赖
+`email` 不再被需求，导出投影只留 `user_id`、`bucket`；无需尾部投影，最终导出仍是
+`export_users`，只含选定列、沿用原列序：
 
 ```json
 {
@@ -353,23 +360,21 @@ curl -s -X POST http://localhost:8080/api/prune \
     {"id": "only_cn", "type": "filter", "input": "users", "references": ["country"]},
     {"id": "export_users", "type": "projection", "input": "only_cn", "columns": [
       {"name": "user_id", "copy": "uid"},
-      {"name": "mail", "copy": "email"},
-      {"name": "bucket", "constant": "ALL"}]},
-    {"id": "export_users__export", "type": "projection",
-     "input": "export_users", "columns": [
-       {"name": "user_id", "copy": "user_id"},
-       {"name": "bucket", "copy": "bucket"}]}
+      {"name": "bucket", "constant": "ALL"}]}
   ],
-  "export": "export_users__export",
+  "export": "export_users",
   "columns": ["user_id", "bucket"],
   "pruned": true,
   "dropped_nodes": [],
-  "added_projection": "export_users__export",
-  "review": {"export": "export_users__export", "blocked": false, "columns": [
+  "added_projection": null,
+  "review": {"export": "export_users", "blocked": false, "columns": [
     {"name": "user_id", "blocked": false, "content_reasons": [], "row_reasons": []},
     {"name": "bucket", "blocked": false, "content_reasons": [], "row_reasons": []}]}
 }
 ```
+
+> 导出为 filter / source 时，未选列可能因条件引用或源列不裁剪而继续存活，那时才会追加
+> 尾部投影（`added_projection` 给出其 ID，最终 `export` 指向它）。
 
 ```bash
 # 2) 用原审查接口 POST /api/review 复审返回的精简图（需要 jq）

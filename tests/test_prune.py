@@ -91,29 +91,77 @@ def test_selecting_all_columns_drops_unreachable_branch_only():
     assert res["nodes"] == GRAPH["nodes"][:3]
 
 
-def test_subset_appends_trailing_projection_preserving_order():
+def test_subset_trims_export_projection_in_place_preserving_order():
     res = call_prune({**GRAPH, "columns": ["bucket", "user_id"]})
-    assert res["export"] == "export_users__export"
-    assert res["added_projection"] == "export_users__export"
-    # Result order follows the export node, not the request order.
-    assert res["columns"] == ["user_id", "bucket"]
+    # The export projection is trimmed in place: no trailing projection.
+    assert res["export"] == "export_users"
+    assert res["added_projection"] is None
+    assert res["dropped_nodes"] == ["other_src", "other"]
 
-    original = res["nodes"][:-1]
-    assert original == GRAPH["nodes"][:3]  # originals untouched, no in-place trim
-    trailing = res["nodes"][-1]
-    assert trailing == {
-        "id": "export_users__export",
-        "type": "projection",
-        "input": "export_users",
-        "columns": [
-            {"name": "user_id", "copy": "user_id"},
-            {"name": "bucket", "copy": "bucket"},
-        ],
-    }
+    export_node = by_id(res["nodes"])["export_users"]
+    # Unselected 'mail' is gone; result order follows the export node, not the
+    # request order; the constant survives untouched.
+    assert export_node["columns"] == [
+        {"name": "user_id", "copy": "uid"},
+        {"name": "bucket", "constant": "ALL"},
+    ]
+    assert res["columns"] == ["user_id", "bucket"]
+    # The now-useless copy dependency 'email' is not demanded anywhere; the
+    # source stays intact (source columns are never trimmed).
+    assert res["nodes"][0] == GRAPH["nodes"][0]
+    assert ids(res["nodes"]) == ["users", "only_cn", "export_users"]
 
     cols = {c["name"]: c for c in res["review"]["columns"]}
     assert set(cols) == {"user_id", "bucket"}
     assert [c["name"] for c in res["review"]["columns"]] == ["user_id", "bucket"]
+
+
+def test_filter_export_still_gets_trailing_projection_for_unselected_pass_through():
+    # A filter export passes every surviving input column through; when its
+    # predicate keeps an unselected column alive, a trailing projection selects.
+    payload = {
+        "nodes": [
+            {"id": "s", "type": "source", "columns": [
+                {"name": "a"}, {"name": "b"}, {"name": "c"}]},
+            {"id": "f", "type": "filter", "input": "s", "references": ["b"]},
+        ],
+        "export": "f",
+        "columns": ["a", "c"],
+    }
+    res = call_prune(payload)
+    assert res["export"] == "f__export"
+    assert res["added_projection"] == "f__export"
+    # The filter keeps its condition and passes a, b, c through; the trailing
+    # projection narrows the final export to the selection (in original order).
+    assert by_id(res["nodes"])["f"]["references"] == ["b"]
+    trailing = res["nodes"][-1]
+    assert trailing == {
+        "id": "f__export",
+        "type": "projection",
+        "input": "f",
+        "columns": [
+            {"name": "a", "copy": "a"},
+            {"name": "c", "copy": "c"},
+        ],
+    }
+    assert res["columns"] == ["a", "c"]
+
+
+def test_source_export_with_subset_gets_trailing_projection():
+    # Source nodes are never trimmed, so a source-export subset needs the
+    # trailing projection even though the demand pass finds nothing to trim.
+    payload = {
+        "nodes": [
+            {"id": "s", "type": "source",
+             "columns": [{"name": "a"}, {"name": "b", "sensitive": True}]},
+        ],
+        "export": "s",
+        "columns": ["a"],
+    }
+    res = call_prune(payload)
+    assert res["export"] == "s__export"
+    assert [c["name"] for c in res["nodes"][0]["columns"]] == ["a", "b"]
+    assert res["nodes"][-1]["columns"] == [{"name": "a", "copy": "a"}]
 
 
 def test_selected_content_and_row_reasons_match_original():
@@ -241,11 +289,12 @@ def test_join_keeps_both_keys_and_both_side_relations():
     }
     res = call_prune(payload)
     j = by_id(res["nodes"])["j"]
-    # The export node is never trimmed: both outputs remain intact...
-    assert [o["alias"] for o in j["outputs"]] == ["v", "info"]
-    # ...keys are retained, and both side relations stay.
+    # The export join is trimmed in place to the selected output...
+    assert [o["alias"] for o in j["outputs"]] == ["v"]
+    # ...keys are retained on both sides, and both side relations stay.
     assert j["left_key"] == "k" and j["right_key"] == "k"
-    assert ids(res["nodes"]) == ["s", "r", "j", "j__export"]
+    assert ids(res["nodes"]) == ["s", "r", "j"]
+    assert res["export"] == "j" and res["added_projection"] is None
     col = res["review"]["columns"][0]
     # Sensitive left key taints rows even though only 'v' is exported.
     assert col["row_reasons"] == [{"node_id": "s", "column": "k"}]
@@ -336,16 +385,14 @@ def test_shared_node_union_demands_from_all_retained_branches():
     }
     res = call_prune(payload)
     p = by_id(res["nodes"])["p"]
-    # The export join stays intact, so it needs a,b,k through its outputs; the
-    # retained filter additionally needs sec. Only the truly unused copy is gone.
-    assert [c["name"] for c in p["columns"]] == ["a", "b", "k", "sec"]
-    # The export join itself is left intact; the trailing projection selects.
+    # The export join is trimmed in place to a,x; it needs a,k (left key) and
+    # x,k (right key); the retained filter additionally needs sec. Only the
+    # truly unused copy 'b' is gone, and shared-branch demands are unioned.
+    assert [c["name"] for c in p["columns"]] == ["a", "k", "sec"]
+    # The export join itself is trimmed to the selection; no trailing node.
     j = by_id(res["nodes"])["j"]
-    assert [o["alias"] for o in j["outputs"]] == ["a", "b", "x"]
-    assert res["export"] == "j__export"
-    # The trailing projection exposes the selection in join output order.
-    trailing = res["nodes"][-1]
-    assert [c["name"] for c in trailing["columns"]] == ["a", "x"]
+    assert [o["alias"] for o in j["outputs"]] == ["a", "x"]
+    assert res["export"] == "j" and res["added_projection"] is None
     col = {c["name"]: c for c in res["review"]["columns"]}
     # Filter on sensitive sec taints every row of the join result.
     assert col["a"]["row_reasons"] == [{"node_id": "s", "column": "secret"}]
@@ -368,8 +415,96 @@ def test_self_join_retains_shared_source_and_key():
         "columns": ["b"],
     }
     res = call_prune(payload)
-    # The single shared source is not duplicated.
-    assert ids(res["nodes"]) == ["s", "j", "j__export"]
+    # The single shared source is not duplicated; the export join is trimmed
+    # in place so no trailing projection is needed.
+    assert ids(res["nodes"]) == ["s", "j"]
+
+
+def test_selected_join_column_demands_its_side_and_both_keys():
+    # Export join selects only a right-side output: the left relation still
+    # has to survive (left key shapes the row set), and its unused output
+    # columns do not.
+    payload = {
+        "nodes": [
+            {"id": "l", "type": "source", "columns": [
+                {"name": "k"}, {"name": "v1"}, {"name": "v2"}]},
+            {"id": "r", "type": "source", "columns": [
+                {"name": "k"}, {"name": "w1"}, {"name": "w2"}]},
+            {"id": "j", "type": "join",
+             "left_input": "l", "right_input": "r",
+             "left_key": "k", "right_key": "k",
+             "outputs": [
+                 {"alias": "a", "side": "left", "column": "v1"},
+                 {"alias": "w", "side": "right", "column": "w1"},
+                 {"alias": "z", "side": "right", "column": "w2"}]},
+        ],
+        "export": "j",
+        "columns": ["w"],
+    }
+    res = call_prune(payload)
+    j = by_id(res["nodes"])["j"]
+    assert j["outputs"] == [{"alias": "w", "side": "right", "column": "w1"}]
+    assert j["left_key"] == "k" and j["right_key"] == "k"
+    # Both source relations survive (sources never trimmed anyway).
+    assert ids(res["nodes"]) == ["l", "r", "j"]
+    assert res["export"] == "j" and res["added_projection"] is None
+
+
+def test_trimming_export_projection_drops_only_its_unused_copy_chain():
+    # Unselected export copies must stop demanding their upstream chain; a
+    # selected constant and a selected copy behave independently.
+    payload = {
+        "nodes": [
+            {"id": "s", "type": "source", "columns": [
+                {"name": "keep", "sensitive": True}, {"name": "drop"}]},
+            {"id": "wide", "type": "projection", "input": "s", "columns": [
+                {"name": "k", "copy": "keep"},
+                {"name": "d", "copy": "drop"},
+                {"name": "lit", "constant": 7}]},
+            {"id": "e", "type": "projection", "input": "wide", "columns": [
+                {"name": "k", "copy": "k"},
+                {"name": "d", "copy": "d"},
+                {"name": "lit", "copy": "lit"}]},
+        ],
+        "export": "e",
+        "columns": ["k", "lit"],
+    }
+    res = call_prune(payload)
+    nodes = by_id(res["nodes"])
+    assert [c["name"] for c in nodes["e"]["columns"]] == ["k", "lit"]
+    # 'wide' keeps only what the trimmed export reads: k plus the (internal)
+    # constant lit; the d -> drop copy chain is gone.
+    assert [c["name"] for c in nodes["wide"]["columns"]] == ["k", "lit"]
+    assert nodes["wide"]["columns"][1] == {"name": "lit", "constant": 7}
+    # Sensitive provenance of 'k' is preserved end to end.
+    col = res["review"]["columns"][0]
+    assert col["name"] == "k"
+    assert col["content_reasons"] == [{"node_id": "s", "column": "keep"}]
+    assert res["export"] == "e" and res["added_projection"] is None
+
+
+def test_filter_reference_column_not_selected_is_still_review_identical():
+    # Sensitive predicate column not among the selected columns must still
+    # taint every selected row: filter condition and input column survive.
+    payload = {
+        "nodes": [
+            {"id": "s", "type": "source", "columns": [
+                {"name": "id_card", "sensitive": True},
+                {"name": "score", "sensitive": False}]},
+            {"id": "e", "type": "filter", "input": "s",
+             "references": ["id_card"]},
+        ],
+        "export": "e",
+        "columns": ["score"],
+    }
+    res = call_prune(payload)
+    assert by_id(res["nodes"])["e"]["references"] == ["id_card"]
+    # The filter still passes id_card through, so a trailing projection picks
+    # score alone...
+    assert res["export"] == "e__export"
+    col = res["review"]["columns"][0]
+    assert col["name"] == "score"
+    assert col["row_reasons"] == [{"node_id": "s", "column": "id_card"}]
 
 
 def test_node_and_column_relative_order_is_preserved():
@@ -407,31 +542,44 @@ def test_constants_and_conditions_are_not_modified():
     }
     res = call_prune(payload)
     p = by_id(res["nodes"])["p"]
-    assert p["columns"][0] == {"name": "n", "constant": None}
-    assert p["columns"][1] == {"name": "x", "constant": "OBJ"}
-    # An explicit null constant survives serialization (no spurious copy).
-    trailing = res["nodes"][-1]
-    assert trailing["columns"] == [
-        {"name": "n", "copy": "n"},
-        {"name": "x", "copy": "x"},
+    # The export projection is trimmed in place; surviving constants — an
+    # explicit null included — are returned byte-for-byte (no spurious copy).
+    assert p["columns"] == [
+        {"name": "n", "constant": None},
+        {"name": "x", "constant": "OBJ"},
     ]
+    assert res["export"] == "p" and res["added_projection"] is None
+    # The constant-only export still demands its input relation; the filter
+    # condition is untouched.
+    assert by_id(res["nodes"])["f"]["references"] == ["a"]
+    assert ids(res["nodes"]) == ["s", "f", "p"]
 
 
 def test_trailing_projection_id_avoids_collision():
+    # A filter export passes the predicate column through, so a trailing
+    # projection is genuinely required. An ancestor already occupies the
+    # generated id; the new node must be renamed deterministically.
     payload = {
         "nodes": [
-            {"id": "s", "type": "source", "columns": [{"name": "a"}, {"name": "b"}]},
-            {"id": "s__export", "type": "projection", "input": "s",
+            {"id": "s", "type": "source",
+             "columns": [{"name": "a"}, {"name": "b"}]},
+            {"id": "f__export", "type": "projection", "input": "s",
              "columns": [{"name": "a", "copy": "a"}, {"name": "b", "copy": "b"}]},
+            {"id": "f", "type": "filter", "input": "f__export",
+             "references": ["b"]},
         ],
-        "export": "s__export",
+        "export": "f",
         "columns": ["a"],
     }
     res = call_prune(payload)
-    assert res["export"] == "s__export__export"
+    assert res["export"] == "f__export_2"
+    assert res["added_projection"] == "f__export_2"
     assert {n["id"] for n in res["nodes"]} == {
-        "s", "s__export", "s__export__export"
+        "s", "f__export", "f", "f__export_2"
     }
+    trailing = res["nodes"][-1]
+    assert trailing["input"] == "f"
+    assert trailing["columns"] == [{"name": "a", "copy": "a"}]
 
 
 def test_pruned_graph_is_plain_json_and_resubmittable():
@@ -471,7 +619,10 @@ def test_unknown_selected_column_rejected_even_if_graph_otherwise_safe():
     expect_engine_error(payload, "PRUNE_COLUMN_NOT_FOUND")
 
 
-def test_trailing_projection_over_node_limit_rejected_without_partial_graph():
+def test_in_place_column_shrink_at_node_limit_succeeds_without_append():
+    # Regression: a 60-node graph whose export projection can shrink in place
+    # must succeed. The old implementation left the export intact and tried to
+    # append a 61st node, falsely reporting PRUNE_NODE_LIMIT.
     nodes = [{"id": "s0", "type": "source",
               "columns": [{"name": "a"}, {"name": "b"}]}]
     for i in range(1, 60):
@@ -481,13 +632,44 @@ def test_trailing_projection_over_node_limit_rejected_without_partial_graph():
             "input": f"n{i - 1}" if i > 1 else "s0",
             "columns": [{"name": "a", "copy": "a"}, {"name": "b", "copy": "b"}],
         })
+    res = call_prune({"nodes": nodes, "export": "n59", "columns": ["a"]})
+    assert len(res["nodes"]) == 60
+    assert res["export"] == "n59"
+    assert res["added_projection"] is None
+    # Every retained projection is narrowed to 'a', export included.
+    assert all(
+        [c["name"] for c in n["columns"]] == ["a"]
+        for n in res["nodes"] if n["type"] == "projection"
+    )
+    assert [c["name"] for c in res["review"]["columns"]] == ["a"]
+    # The 60-node result stays re-submittable to /api/review as-is.
+    re_reviewed = call_review({"nodes": res["nodes"], "export": res["export"]})
+    assert re_reviewed == res["review"]
+
+
+def test_genuinely_needed_61st_node_at_limit_rejected_without_partial_graph():
+    # A filter export keeps its predicate column in the pass-through relation,
+    # so narrowing the columns genuinely requires the trailing projection:
+    # the 61st node is unavoidable and the request is rejected.
+    nodes = [{"id": "s0", "type": "source",
+              "columns": [{"name": "a"}, {"name": "b"}]}]
+    for i in range(1, 59):
+        nodes.append({
+            "id": f"n{i}",
+            "type": "projection",
+            "input": f"n{i - 1}" if i > 1 else "s0",
+            "columns": [{"name": "a", "copy": "a"}, {"name": "b", "copy": "b"}],
+        })
+    nodes.append({
+        "id": "f59", "type": "filter", "input": "n58", "references": ["b"],
+    })
     exc = expect_engine_error(
-        {"nodes": nodes, "export": "n59", "columns": ["a"]},
+        {"nodes": nodes, "export": "f59", "columns": ["a"]},
         "PRUNE_NODE_LIMIT",
     )
     detail = exc.detail()
     assert detail["node_count"] == 61 and detail["limit"] == 60
-    assert detail["node_id"] == "n59"
+    assert detail["node_id"] == "f59"
 
 
 def test_selecting_all_at_node_limit_still_succeeds_without_append():
@@ -650,7 +832,9 @@ def test_http_prune_success_and_review_follow_up():
     resp = client.post("/api/prune", json={**GRAPH, "columns": ["bucket", "user_id"]})
     assert resp.status_code == 200
     body = resp.json()
-    assert body["export"] == "export_users__export"
+    # The export projection is trimmed in place; no trailing projection.
+    assert body["export"] == "export_users"
+    assert body["added_projection"] is None
     assert [c["name"] for c in body["review"]["columns"]] == ["user_id", "bucket"]
 
     follow = client.post("/api/review",
@@ -670,6 +854,24 @@ def test_http_prune_unknown_column_returns_400_without_partial_graph():
 
 
 def test_http_prune_node_limit_returns_400():
+    # Filter export keeps the referenced column alive, so the selection
+    # genuinely needs a 61st node.
+    nodes = [{"id": "s0", "type": "source",
+              "columns": [{"name": "a"}, {"name": "b"}]}]
+    for i in range(1, 59):
+        nodes.append({"id": f"n{i}", "type": "projection",
+                      "input": f"n{i - 1}" if i > 1 else "s0",
+                      "columns": [{"name": "a", "copy": "a"},
+                                  {"name": "b", "copy": "b"}]})
+    nodes.append({"id": "f59", "type": "filter", "input": "n58",
+                  "references": ["b"]})
+    resp = client.post("/api/prune",
+                       json={"nodes": nodes, "export": "f59", "columns": ["a"]})
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "PRUNE_NODE_LIMIT"
+
+
+def test_http_prune_in_place_shrink_at_node_limit_succeeds():
     nodes = [{"id": "s0", "type": "source",
               "columns": [{"name": "a"}, {"name": "b"}]}]
     for i in range(1, 60):
@@ -679,8 +881,12 @@ def test_http_prune_node_limit_returns_400():
                                   {"name": "b", "copy": "b"}]})
     resp = client.post("/api/prune",
                        json={"nodes": nodes, "export": "n59", "columns": ["a"]})
-    assert resp.status_code == 400
-    assert resp.json()["error"]["code"] == "PRUNE_NODE_LIMIT"
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["export"] == "n59"
+    assert body["added_projection"] is None
+    assert len(body["nodes"]) == 60
+    assert [c["name"] for c in body["review"]["columns"]] == ["a"]
 
 
 def test_http_prune_schema_error_returns_422():
